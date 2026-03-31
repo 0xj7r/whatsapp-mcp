@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
-	"math/rand"
+	mathrand "math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -233,6 +236,10 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	// Check if we have media to send
 	if mediaPath != "" {
+		// SECURITY: Validate path before reading to prevent arbitrary file exfiltration
+		if err := validateMediaPath(mediaPath); err != nil {
+			return false, fmt.Sprintf("Security: blocked media path: %v", err)
+		}
 		// Read media file
 		mediaData, err := os.ReadFile(mediaPath)
 		if err != nil {
@@ -399,6 +406,11 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 	if doc := msg.GetDocumentMessage(); doc != nil {
 		filename := doc.GetFileName()
 		if filename == "" {
+			filename = "document_" + time.Now().Format("20060102_150405")
+		}
+		// SECURITY: Sanitize filename to prevent path traversal attacks
+		filename = filepath.Base(filename)
+		if filename == "." || filename == ".." || filename == "/" {
 			filename = "document_" + time.Now().Format("20060102_150405")
 		}
 		return "document", filename,
@@ -590,13 +602,23 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 		return false, "", "", "", fmt.Errorf("failed to create chat directory: %v", err)
 	}
 
-	// Generate a local path for the file
-	localPath = fmt.Sprintf("%s/%s", chatDir, filename)
+	// SECURITY: Sanitize filename and enforce path containment
+	filename = filepath.Base(filename)
+	if filename == "." || filename == ".." || filename == "/" {
+		filename = "file_" + time.Now().Format("20060102_150405")
+	}
 
-	// Get absolute path
+	// Generate a local path for the file
+	localPath = filepath.Join(chatDir, filename)
+
+	// Get absolute path and verify it's inside chatDir
 	absPath, err := filepath.Abs(localPath)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to get absolute path: %v", err)
+	}
+	absChatDir, _ := filepath.Abs(chatDir)
+	if !strings.HasPrefix(absPath, absChatDir+string(filepath.Separator)) && absPath != absChatDir {
+		return false, "", "", "", fmt.Errorf("security: path traversal blocked for filename: %s", filename)
 	}
 
 	// Check if file already exists
@@ -675,27 +697,75 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// SECURITY: Generate a cryptographically secure random key
+func generateSecureKey() string {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		fmt.Fprintf(os.Stderr, "FATAL: failed to generate secure key: %v\n", err)
+		os.Exit(1)
+	}
+	return hex.EncodeToString(b)
+}
+
 // SECURITY: API key authentication middleware
+// - Uses crypto/rand for key generation
+// - Constant-time comparison to prevent timing attacks
+// - Only accepts X-API-Key header (no query string to avoid logging)
+// - Fails closed if no key is configured
 func requireAPIKey(next http.HandlerFunc) http.HandlerFunc {
 	apiKey := os.Getenv("WHATSAPP_BRIDGE_API_KEY")
 	if apiKey == "" {
-		// Generate a random key on first run and print it
-		apiKey = fmt.Sprintf("%x", rand.Int63())
-		fmt.Printf("\n⚠️  SECURITY: No WHATSAPP_BRIDGE_API_KEY set. Generated temporary key: %s\n", apiKey)
+		apiKey = generateSecureKey()
+		fmt.Printf("\n⚠️  SECURITY: No WHATSAPP_BRIDGE_API_KEY set. Generated key: %s\n", apiKey)
 		fmt.Println("Set WHATSAPP_BRIDGE_API_KEY env var to use a persistent key.")
 		os.Setenv("WHATSAPP_BRIDGE_API_KEY", apiKey)
 	}
+	apiKeyBytes := []byte(apiKey)
 	return func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-API-Key")
-		if key == "" {
-			key = r.URL.Query().Get("api_key")
-		}
-		if key != apiKey {
+		if len(key) == 0 || subtle.ConstantTimeCompare([]byte(key), apiKeyBytes) != 1 {
 			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
 			return
 		}
 		next(w, r)
 	}
+}
+
+// SECURITY: Validate media file path to prevent arbitrary file read/exfiltration
+func validateMediaPath(mediaPath string) error {
+	absPath, err := filepath.Abs(mediaPath)
+	if err != nil {
+		return fmt.Errorf("invalid path: %v", err)
+	}
+	// Resolve symlinks
+	absPath, err = filepath.EvalSymlinks(absPath)
+	if err != nil {
+		return fmt.Errorf("invalid path: %v", err)
+	}
+	// Block sensitive directories
+	homeDir, _ := os.UserHomeDir()
+	blocked := []string{
+		filepath.Join(homeDir, ".ssh"),
+		filepath.Join(homeDir, ".gnupg"),
+		filepath.Join(homeDir, ".aws"),
+		filepath.Join(homeDir, ".claude"),
+		filepath.Join(homeDir, ".config"),
+		"/etc", "/var", "/usr", "/System",
+	}
+	for _, b := range blocked {
+		if strings.HasPrefix(absPath, b) {
+			return fmt.Errorf("access to %s is blocked", b)
+		}
+	}
+	// Check file size (max 50MB)
+	info, err := os.Stat(absPath)
+	if err != nil {
+		return fmt.Errorf("cannot stat file: %v", err)
+	}
+	if info.Size() > 50*1024*1024 {
+		return fmt.Errorf("file too large: %d bytes (max 50MB)", info.Size())
+	}
+	return nil
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
@@ -797,13 +867,20 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	}))
 
-	// Start the server — SECURITY: bind to localhost only
+	// Start the server — SECURITY: bind to localhost only, with timeouts
 	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s (localhost only)...\n", serverAddr)
 
+	server := &http.Server{
+		Addr:         serverAddr,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		if err := server.ListenAndServe(); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -1329,7 +1406,7 @@ func placeholderWaveform(duration uint32) []byte {
 	waveform := make([]byte, waveformLength)
 
 	// Seed the random number generator for consistent results with the same duration
-	rand.Seed(int64(duration))
+	mathrand.Seed(int64(duration))
 
 	// Create a more natural looking waveform with some patterns and variability
 	// rather than completely random values
@@ -1348,7 +1425,7 @@ func placeholderWaveform(duration uint32) []byte {
 		val += (baseAmplitude / 2) * math.Sin(pos*math.Pi*frequencyFactor*16)
 
 		// Add some randomness to make it look more natural
-		val += (rand.Float64() - 0.5) * 15
+		val += (mathrand.Float64() - 0.5) * 15
 
 		// Add some fade-in and fade-out effects
 		fadeInOut := math.Sin(pos * math.Pi)
