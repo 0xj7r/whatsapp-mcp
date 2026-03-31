@@ -1,3 +1,7 @@
+import os
+import json
+import logging
+from datetime import datetime
 from typing import List, Dict, Any, Optional
 from mcp.server.fastmcp import FastMCP
 from whatsapp import (
@@ -15,16 +19,83 @@ from whatsapp import (
     download_media as whatsapp_download_media
 )
 
+# --- SECURITY: Audit logging ---
+AUDIT_LOG_PATH = os.path.expanduser("~/.whatsapp-mcp/audit.log")
+os.makedirs(os.path.dirname(AUDIT_LOG_PATH), exist_ok=True)
+
+audit_logger = logging.getLogger("whatsapp_audit")
+audit_logger.setLevel(logging.INFO)
+_handler = logging.FileHandler(AUDIT_LOG_PATH)
+_handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s"))
+audit_logger.addHandler(_handler)
+
+def _audit(action: str, details: dict):
+    """Log all tool invocations for security auditing."""
+    audit_logger.info(json.dumps({"action": action, **details}))
+
+# --- SECURITY: Rate limiting for write operations ---
+_write_timestamps: list[float] = []
+WRITE_RATE_LIMIT = 10  # max writes per minute
+WRITE_RATE_WINDOW = 60  # seconds
+
+def _check_write_rate_limit():
+    """Prevent rapid-fire writes that could indicate prompt injection abuse."""
+    import time
+    now = time.time()
+    _write_timestamps[:] = [t for t in _write_timestamps if now - t < WRITE_RATE_WINDOW]
+    if len(_write_timestamps) >= WRITE_RATE_LIMIT:
+        raise RuntimeError(
+            f"SECURITY: Write rate limit exceeded ({WRITE_RATE_LIMIT} per {WRITE_RATE_WINDOW}s). "
+            "This may indicate a prompt injection attack. Action blocked."
+        )
+    _write_timestamps.append(now)
+
+# --- SECURITY: Input validation ---
+def _validate_recipient(recipient: str) -> str:
+    """Validate and sanitize recipient to prevent injection."""
+    if not recipient or not isinstance(recipient, str):
+        raise ValueError("Invalid recipient")
+    # Strip whitespace and validate format
+    recipient = recipient.strip()
+    # Must be a phone number (digits only) or a valid JID
+    if "@" in recipient:
+        if not (recipient.endswith("@s.whatsapp.net") or recipient.endswith("@g.us")):
+            raise ValueError(f"Invalid JID format: {recipient}")
+    else:
+        # Phone number: only digits allowed
+        cleaned = recipient.replace("+", "").replace(" ", "").replace("-", "")
+        if not cleaned.isdigit():
+            raise ValueError(f"Invalid phone number: {recipient}")
+        recipient = cleaned
+    return recipient
+
+def _validate_file_path(path: str) -> str:
+    """Validate file paths to prevent directory traversal."""
+    path = os.path.realpath(path)
+    # Block access to sensitive directories
+    blocked = [
+        os.path.expanduser("~/.ssh"),
+        os.path.expanduser("~/.gnupg"),
+        os.path.expanduser("~/.aws"),
+        os.path.expanduser("~/.claude"),
+        "/etc", "/var", "/usr",
+    ]
+    for b in blocked:
+        if path.startswith(b):
+            raise ValueError(f"SECURITY: Access to {b} is blocked")
+    return path
+
 # Initialize FastMCP server
 mcp = FastMCP("whatsapp")
 
 @mcp.tool()
 def search_contacts(query: str) -> List[Dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
-    
+
     Args:
         query: Search term to match against contact names or phone numbers
     """
+    _audit("search_contacts", {"query": query})
     contacts = whatsapp_search_contacts(query)
     return contacts
 
@@ -161,22 +232,25 @@ def send_message(
 ) -> Dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
+    SECURITY: This is a write operation. All invocations are audit-logged and rate-limited.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         message: The message text to send
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
-    # Validate input
-    if not recipient:
-        return {
-            "success": False,
-            "message": "Recipient must be provided"
-        }
-    
-    # Call the whatsapp_send_message function with the unified recipient parameter
+    try:
+        _check_write_rate_limit()
+        recipient = _validate_recipient(recipient)
+    except (ValueError, RuntimeError) as e:
+        _audit("send_message_BLOCKED", {"recipient": recipient, "reason": str(e)})
+        return {"success": False, "message": str(e)}
+
+    _audit("send_message", {"recipient": recipient, "message_length": len(message)})
+
     success, status_message = whatsapp_send_message(recipient, message)
     return {
         "success": success,
@@ -186,17 +260,28 @@ def send_message(
 @mcp.tool()
 def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
-    
+
+    SECURITY: This is a write operation. All invocations are audit-logged and rate-limited.
+    File paths are validated to prevent access to sensitive directories.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the media file to send (image, video, document)
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
-    
-    # Call the whatsapp_send_file function
+    try:
+        _check_write_rate_limit()
+        recipient = _validate_recipient(recipient)
+        media_path = _validate_file_path(media_path)
+    except (ValueError, RuntimeError) as e:
+        _audit("send_file_BLOCKED", {"recipient": recipient, "media_path": media_path, "reason": str(e)})
+        return {"success": False, "message": str(e)}
+
+    _audit("send_file", {"recipient": recipient, "media_path": media_path})
+
     success, status_message = whatsapp_send_file(recipient, media_path)
     return {
         "success": success,
@@ -206,15 +291,27 @@ def send_file(recipient: str, media_path: str) -> Dict[str, Any]:
 @mcp.tool()
 def send_audio_message(recipient: str, media_path: str) -> Dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
-    
+
+    SECURITY: This is a write operation. All invocations are audit-logged and rate-limited.
+
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
         media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
-    
+
     Returns:
         A dictionary containing success status and a status message
     """
+    try:
+        _check_write_rate_limit()
+        recipient = _validate_recipient(recipient)
+        media_path = _validate_file_path(media_path)
+    except (ValueError, RuntimeError) as e:
+        _audit("send_audio_BLOCKED", {"recipient": recipient, "media_path": media_path, "reason": str(e)})
+        return {"success": False, "message": str(e)}
+
+    _audit("send_audio_message", {"recipient": recipient, "media_path": media_path})
+
     success, status_message = whatsapp_audio_voice_message(recipient, media_path)
     return {
         "success": success,
